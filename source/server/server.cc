@@ -20,11 +20,13 @@
 
 #include "common/api/api_impl.h"
 #include "common/api/os_sys_calls_impl.h"
+#include "common/common/mutex_tracer_impl.h"
 #include "common/common/utility.h"
 #include "common/common/version.h"
 #include "common/config/bootstrap_json.h"
 #include "common/config/resources.h"
 #include "common/config/utility.h"
+#include "common/http/codes.h"
 #include "common/local_info/local_info_impl.h"
 #include "common/memory/stats.h"
 #include "common/network/address_impl.h"
@@ -49,18 +51,21 @@ InstanceImpl::InstanceImpl(Options& options, Event::TimeSystem& time_system,
                            Thread::BasicLockable& access_log_lock,
                            ComponentFactory& component_factory,
                            Runtime::RandomGeneratorPtr&& random_generator,
-                           ThreadLocal::Instance& tls)
+                           ThreadLocal::Instance& tls, Thread::ThreadFactory& thread_factory)
     : shutdown_(false), options_(options), time_system_(time_system), restarter_(restarter),
       start_time_(time(nullptr)), original_start_time_(start_time_), stats_store_(store),
-      thread_local_(tls), api_(new Api::Impl(options.fileFlushIntervalMsec())),
+      thread_local_(tls),
+      api_(new Api::Impl(options.fileFlushIntervalMsec(), thread_factory, store)),
       secret_manager_(std::make_unique<Secret::SecretManagerImpl>()),
       dispatcher_(api_->allocateDispatcher(time_system)),
-      singleton_manager_(new Singleton::ManagerImpl()),
+      singleton_manager_(new Singleton::ManagerImpl(api_->threadFactory().currentThreadId())),
       handler_(new ConnectionHandlerImpl(ENVOY_LOGGER(), *dispatcher_)),
       random_generator_(std::move(random_generator)), listener_component_factory_(*this),
       worker_factory_(thread_local_, *api_, hooks, time_system),
       dns_resolver_(dispatcher_->createDnsResolver({})),
-      access_log_manager_(*api_, *dispatcher_, access_log_lock, store), terminated_(false) {
+      access_log_manager_(*api_, *dispatcher_, access_log_lock), terminated_(false),
+      mutex_tracer_(options.mutexTracingEnabled() ? &Envoy::MutexTracerImpl::getOrCreateTracer()
+                                                  : nullptr) {
 
   try {
     if (!options.logPath().empty()) {
@@ -111,9 +116,7 @@ InstanceImpl::~InstanceImpl() {
   listener_manager_.reset();
 }
 
-Upstream::ClusterManager& InstanceImpl::clusterManager() { return *config_->clusterManager(); }
-
-Tracing::HttpTracer& InstanceImpl::httpTracer() { return config_->httpTracer(); }
+Upstream::ClusterManager& InstanceImpl::clusterManager() { return *config_.clusterManager(); }
 
 void InstanceImpl::drainListeners() {
   ENVOY_LOG(info, "closing and draining listeners");
@@ -151,10 +154,10 @@ void InstanceImpl::flushStats() {
     server_stats_->total_connections_.set(numConnections() + info.num_connections_);
     server_stats_->days_until_first_cert_expiring_.set(
         sslContextManager().daysUntilFirstCertExpires());
-    InstanceUtil::flushMetricsToSinks(config_->statsSinks(), stats_store_.source());
+    InstanceUtil::flushMetricsToSinks(config_.statsSinks(), stats_store_.source());
     // TODO(ramaraochavali): consider adding different flush interval for histograms.
     if (stat_flush_timer_ != nullptr) {
-      stat_flush_timer_->enableTimer(config_->statsFlushInterval());
+      stat_flush_timer_->enableTimer(config_.statsFlushInterval());
     }
   });
 }
@@ -304,13 +307,14 @@ void InstanceImpl::initialize(Options& options,
 
   cluster_manager_factory_ = std::make_unique<Upstream::ProdClusterManagerFactory>(
       runtime(), stats(), threadLocal(), random(), dnsResolver(), sslContextManager(), dispatcher(),
-      localInfo(), secretManager());
+      localInfo(), secretManager(), api(), http_context_);
 
-  // Now the configuration gets parsed. The configuration may start setting thread local data
-  // per above. See MainImpl::initialize() for why we do this pointer dance.
-  Configuration::MainImpl* main_config = new Configuration::MainImpl();
-  config_.reset(main_config);
-  main_config->initialize(bootstrap_, *this, *cluster_manager_factory_);
+  // Now the configuration gets parsed. The configuration may start setting
+  // thread local data per above. See MainImpl::initialize() for why ConfigImpl
+  // is constructed as part of the InstanceImpl and then populated once
+  // cluster_manager_factory_ is available.
+  config_.initialize(bootstrap_, *this, *cluster_manager_factory_);
+  http_context_.setTracer(config_.httpTracer());
 
   // Instruct the listener manager to create the LDS provider if needed. This must be done later
   // because various items do not yet exist when the listener manager is created.
@@ -321,7 +325,7 @@ void InstanceImpl::initialize(Options& options,
   if (bootstrap_.has_hds_config()) {
     const auto& hds_config = bootstrap_.hds_config();
     async_client_manager_ = std::make_unique<Grpc::AsyncClientManagerImpl>(
-        clusterManager(), thread_local_, time_system_);
+        clusterManager(), thread_local_, time_system_, api());
     hds_delegate_ = std::make_unique<Upstream::HdsDelegate>(
         bootstrap_.node(), stats(),
         Config::Utility::factoryForGrpcApiConfigSource(*async_client_manager_, hds_config, stats())
@@ -330,18 +334,18 @@ void InstanceImpl::initialize(Options& options,
         access_log_manager_, clusterManager(), localInfo());
   }
 
-  for (Stats::SinkPtr& sink : main_config->statsSinks()) {
+  for (Stats::SinkPtr& sink : config_.statsSinks()) {
     stats_store_.addSink(*sink);
   }
 
   // Some of the stat sinks may need dispatcher support so don't flush until the main loop starts.
   // Just setup the timer.
   stat_flush_timer_ = dispatcher_->createTimer([this]() -> void { flushStats(); });
-  stat_flush_timer_->enableTimer(config_->statsFlushInterval());
+  stat_flush_timer_->enableTimer(config_.statsFlushInterval());
 
   // GuardDog (deadlock detection) object and thread setup before workers are
   // started and before our own run() loop runs.
-  guard_dog_ = std::make_unique<Server::GuardDogImpl>(stats_store_, *config_, time_system_);
+  guard_dog_ = std::make_unique<Server::GuardDogImpl>(stats_store_, config_, time_system_, api());
 }
 
 void InstanceImpl::startWorkers() {
@@ -363,11 +367,9 @@ Runtime::LoaderPtr InstanceUtil::createRuntime(Instance& server,
         config.runtime()->overrideSubdirectory() + "/" + server.localInfo().clusterName();
     ENVOY_LOG(info, "runtime override subdirectory: {}", override_subdirectory);
 
-    Api::OsSysCallsPtr os_sys_calls(new Api::OsSysCallsImpl);
     return std::make_unique<Runtime::DiskBackedLoaderImpl>(
         server.dispatcher(), server.threadLocal(), config.runtime()->symlinkRoot(),
-        config.runtime()->subdirectory(), override_subdirectory, server.stats(), server.random(),
-        std::move(os_sys_calls));
+        config.runtime()->subdirectory(), override_subdirectory, server.stats(), server.random());
   } else {
     return std::make_unique<Runtime::LoaderImpl>(server.random(), server.stats(),
                                                  server.threadLocal());
@@ -388,25 +390,32 @@ void InstanceImpl::loadServerFlags(const absl::optional<std::string>& flags_path
 
 uint64_t InstanceImpl::numConnections() { return listener_manager_->numConnections(); }
 
-RunHelper::RunHelper(Instance& instance, Event::Dispatcher& dispatcher,
+RunHelper::RunHelper(Instance& instance, Options& options, Event::Dispatcher& dispatcher,
                      Upstream::ClusterManager& cm, AccessLog::AccessLogManager& access_log_manager,
                      InitManagerImpl& init_manager, OverloadManager& overload_manager,
                      std::function<void()> workers_start_cb) {
 
   // Setup signals.
-  sigterm_ = dispatcher.listenForSignal(SIGTERM, [&instance]() {
-    ENVOY_LOG(warn, "caught SIGTERM");
-    instance.shutdown();
-  });
+  if (options.signalHandlingEnabled()) {
+    sigterm_ = dispatcher.listenForSignal(SIGTERM, [&instance]() {
+      ENVOY_LOG(warn, "caught SIGTERM");
+      instance.shutdown();
+    });
 
-  sig_usr_1_ = dispatcher.listenForSignal(SIGUSR1, [&access_log_manager]() {
-    ENVOY_LOG(warn, "caught SIGUSR1");
-    access_log_manager.reopen();
-  });
+    sigint_ = dispatcher.listenForSignal(SIGINT, [&instance]() {
+      ENVOY_LOG(warn, "caught SIGINT");
+      instance.shutdown();
+    });
 
-  sig_hup_ = dispatcher.listenForSignal(SIGHUP, []() {
-    ENVOY_LOG(warn, "caught and eating SIGHUP. See documentation for how to hot restart.");
-  });
+    sig_usr_1_ = dispatcher.listenForSignal(SIGUSR1, [&access_log_manager]() {
+      ENVOY_LOG(warn, "caught SIGUSR1");
+      access_log_manager.reopen();
+    });
+
+    sig_hup_ = dispatcher.listenForSignal(SIGHUP, []() {
+      ENVOY_LOG(warn, "caught and eating SIGHUP. See documentation for how to hot restart.");
+    });
+  }
 
   // Register for cluster manager init notification. We don't start serving worker traffic until
   // upstream clusters are initialized which may involve running the event loop. Note however that
@@ -446,13 +455,13 @@ RunHelper::RunHelper(Instance& instance, Event::Dispatcher& dispatcher,
 void InstanceImpl::run() {
   // We need the RunHelper to be available to call from InstanceImpl::shutdown() below, so
   // we save it as a member variable.
-  run_helper_ = std::make_unique<RunHelper>(*this, *dispatcher_, clusterManager(),
+  run_helper_ = std::make_unique<RunHelper>(*this, options_, *dispatcher_, clusterManager(),
                                             access_log_manager_, init_manager_, overloadManager(),
                                             [this]() -> void { startWorkers(); });
 
   // Run the main dispatch loop waiting to exit.
   ENVOY_LOG(info, "starting main dispatch loop");
-  auto watchdog = guard_dog_->createWatchDog(Thread::Thread::currentThreadId());
+  auto watchdog = guard_dog_->createWatchDog(api_->threadFactory().currentThreadId());
   watchdog->startWatchdog(*dispatcher_);
   dispatcher_->run(Event::Dispatcher::RunType::Block);
   ENVOY_LOG(info, "main dispatch loop exited");
@@ -489,8 +498,8 @@ void InstanceImpl::terminate() {
     flushStats();
   }
 
-  if (config_ != nullptr && config_->clusterManager() != nullptr) {
-    config_->clusterManager()->shutdown();
+  if (config_.clusterManager() != nullptr) {
+    config_.clusterManager()->shutdown();
   }
   handler_.reset();
   thread_local_.shutdownThread();
